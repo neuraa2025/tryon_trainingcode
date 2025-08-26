@@ -27,6 +27,8 @@ from diffusers.models import UNet2DModel, AutoencoderKL
 from transformers import CLIPTextModel, CLIPTokenizer
 import torchvision.transforms as transforms
 
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
@@ -44,9 +46,9 @@ logger = logging.getLogger(__name__)
 class TrainingConfig:
     """Enhanced training configuration with masked generation support"""
     # Dataset Configuration
-    data_root: str = "dataset"
+    data_root: str = "/kaggle/input/ownmodel/dataset"
     batch_size: int = 4
-    num_workers: int = 1
+    num_workers: int = 2
     
     # Model Configuration
     timesteps: int = 3600
@@ -81,7 +83,7 @@ class TrainingConfig:
     num_epochs: int = 250
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 2
     max_grad_norm: float = 1.0
     
     # Diffusion Configuration
@@ -97,7 +99,7 @@ class TrainingConfig:
     max_validation_samples: int = 4
     
     # Output Configuration
-    output_dir: str = "enhanced_masked_ootd_training"
+    output_dir: str = "/kaggle/working/"
     checkpoint_dir: str = "checkpoints"
     results_dir: str = "results"
     logs_dir: str = "logs"
@@ -782,6 +784,7 @@ class EnhancedProductionOOTDTrainer:
             'lr': [],
             'time': []
         }
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.config.mixed_precision)
 
         self.load_checkpoint()
         
@@ -834,6 +837,10 @@ class EnhancedProductionOOTDTrainer:
         """Initialize models"""
         self.model = ProductionOOTDUNet(self.config).to(self.device)
         
+        if torch.cuda.device_count() > 1:
+            logger.info(f"Using {torch.cuda.device_count()} GPUs!")
+            self.model = torch.nn.DataParallel(self.model)
+
         # VAE and text encoder initialization
         try:
             local_vae_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
@@ -1268,6 +1275,7 @@ class EnhancedProductionOOTDTrainer:
         
         avg_loss = total_loss / num_batches if num_batches > 0 else 0
         self.model.train()
+        torch.cuda.empty_cache()
         return avg_loss
 
     def generate_enhanced_validation_samples(self, batch, batch_idx):
@@ -1331,6 +1339,7 @@ class EnhancedProductionOOTDTrainer:
             self.create_masked_visualization(
                 batch_subset, generated_images, None, self.epoch, batch_idx, "validation"
             )
+            plt.show()
 
     def save_checkpoint(self, epoch, loss, is_best=False):
         """Save model checkpoint with enhanced information"""
@@ -1414,19 +1423,29 @@ class EnhancedProductionOOTDTrainer:
             self.model.train()
             epoch_loss = 0
             num_batches = 0
+            self.optimizer.zero_grad() # Zero gradients once before starting accumulation
             
             for batch_idx, batch in enumerate(self.dataloader):
-                self.optimizer.zero_grad()
+                with torch.cuda.amp.autocast(enabled=self.config.mixed_precision):
+                    loss = self.training_step(batch)
+                    
+                    # Handle DataParallel output
+                    if isinstance(loss, torch.Tensor) and loss.dim() > 0:
+                        loss = loss.mean()
+                    
+                    loss = loss / self.config.gradient_accumulation_steps
+
+                self.scaler.scale(loss).backward()
+
+                if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
+                    self.lr_scheduler.step()
                 
-                loss = self.training_step(batch)
-                loss.backward()
-                
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-                
-                self.optimizer.step()
-                self.lr_scheduler.step()
-                
-                epoch_loss += loss.item()
+                epoch_loss += loss.item() * self.config.gradient_accumulation_steps
                 num_batches += 1
                 self.global_step += 1
                 
@@ -1483,22 +1502,22 @@ def main():
     """ENHANCED: Main training function with masked generation"""
     # Enhanced configuration with masked generation enabled
     config = TrainingConfig(
-        data_root="dataset",
+        data_root="/kaggle/input/ownmodel/dataset",
         num_epochs=2500,
         timesteps=2500,
-        batch_size=12,
+        batch_size=6, # Further reduced for gradient accumulation
         learning_rate=1e-4,
-        output_dir="deepoutput",
+        output_dir="/kaggle/working/",
         normalize_images=True,
         save_comprehensive_results=True,
-        validate_data_loading=True,  # Enable comprehensive validation
-        save_debug_samples=True,     # Save debug samples
-        max_debug_samples=5,         # Number of samples to debug
+        validate_data_loading=True,
+        save_debug_samples=True,
+        max_debug_samples=5,
         
         # ENHANCED: Masked Generation Settings
-        use_masked_generation=True,  # Enable masked generation
-        mask_loss_weight=2.0,        # Higher weight for masked regions
-        preserve_unmasked=True,      # Keep unmasked regions unchanged
+        use_masked_generation=True,
+        mask_loss_weight=2.0,
+        preserve_unmasked=True,
         
         image_mean=(0.485, 0.456, 0.406),
         image_std=(0.229, 0.224, 0.225)
