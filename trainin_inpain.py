@@ -11,6 +11,7 @@ import time
 import torch
 import logging
 import warnings
+import gc
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, asdict
@@ -1474,6 +1475,11 @@ class EnhancedProductionOOTDTrainer:
             logger.info(f"   Best Loss: {self.best_loss:.6f}")
             logger.info(f"   Masked Generation: {'ENABLED' if self.config.use_masked_generation else 'DISABLED'}")
             logger.info("=" * 80)
+
+            # Manually clear memory
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         total_training_time = time.time() - start_time
         logger.info(f"Masked generation training completed! Total time: {total_training_time:.2f}s")
